@@ -14,6 +14,8 @@ Scaffold + shared code for a family of **bring‑your‑own‑key** Android apps
 | Trip Weaver | Travel & Local | https://github.com/Mohithash/TripWeaver |
 | Braindump | Productivity | https://github.com/Mohithash/Braindump |
 | Sprout | House & Home / Lifestyle | https://github.com/Mohithash/Sprout |
+| Draftly | Communication / Business | https://github.com/Mohithash/Draftly |
+| Story Nest | Parenting / Books | https://github.com/Mohithash/StoryNest |
 
 ## Kit
 - `template/src/ai/AiClient.kt` — raw‑HTTP client for Anthropic Messages (JSON‑schema `output_config.format`, image blocks) and OpenAI‑compatible chat completions; `Schema` helpers.
