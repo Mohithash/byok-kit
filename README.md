@@ -17,8 +17,10 @@ Scaffold + shared code for a family of **bring‑your‑own‑key** Android apps
 | Draftly | Communication / Business | https://github.com/Mohithash/Draftly |
 | Story Nest | Parenting / Books | https://github.com/Mohithash/StoryNest |
 
-## Factory (103 more apps)
-A config-driven engine at https://github.com/Mohithash/byok-factory builds one app per JSON spec (Gradle flavors). See its `CATALOG.md` for all 103 apps with listings and releases.
+## Factory (603 more apps) + Store
+A config-driven engine at https://github.com/Mohithash/byok-factory builds one app per JSON spec (Gradle flavors). See its `CATALOG.md` for all 603 apps with listings and releases.
+
+**App store:** https://mohithash.github.io/byok-store/ (web) · https://github.com/Mohithash/StoreApp (native Android store with one-tap install).
 
 ## Kit
 - `template/src/ai/AiClient.kt` — raw‑HTTP client for Anthropic Messages (JSON‑schema `output_config.format`, image blocks) and OpenAI‑compatible chat completions; `Schema` helpers.
