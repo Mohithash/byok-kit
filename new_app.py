@@ -49,6 +49,7 @@ for d in ["gradle", "gradlew", "settings.gradle.kts", "build.gradle.kts", "gradl
 os.makedirs(f"{root}/app/src/main/res/values", exist_ok=True)
 os.makedirs(f"{root}/app/src/main/res/drawable", exist_ok=True)
 os.makedirs(f"{root}/app/src/main/res/mipmap-anydpi-v26", exist_ok=True)
+os.makedirs(f"{root}/app/src/main/res/xml", exist_ok=True)
 os.makedirs(f"{root}/app/src/test/java/{PKG.replace('.', '/')}", exist_ok=True)
 w = lambda p, c: open(p, "w").write(c)
 w(f"{root}/settings.gradle.kts", open(f"{root}/settings.gradle.kts").read().replace('rootProject.name = "CalorieBank"', f'rootProject.name = "{name}"'))
@@ -57,7 +58,7 @@ w(f"{root}/app/build.gradle.kts", bg)
 shutil.copy(f"{K}/template/proguard-rules.pro", f"{root}/app/proguard-rules.pro")
 w(f"{root}/app/proguard-rules.pro", open(f"{root}/app/proguard-rules.pro").read().replace("__PKG__", PKG).replace("domain", "**"))
 # kit sources
-for rel in ["ai/AiClient.kt", "data/JsonStore.kt", "ui/Ui.kt", "ui/Photo.kt", "ui/theme/Theme.kt", "ui/screens/AiSettingsCard.kt"]:
+for rel in ["ai/AiClient.kt", "data/JsonStore.kt", "ui/Ui.kt", "ui/Photo.kt", "ui/Speech.kt", "ui/theme/Theme.kt", "ui/screens/AiSettingsCard.kt"]:
     os.makedirs(os.path.dirname(f"{src}/{rel}"), exist_ok=True)
     w(f"{src}/{rel}", open(f"{K}/template/src/{rel}").read().replace("__PKG__", PKG))
 w(f"{src}/ui/theme/Brand.kt", f"""package {PKG}.ui.theme
@@ -77,9 +78,16 @@ w(f"{root}/app/src/main/AndroidManifest.xml", f"""<?xml version="1.0" encoding="
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <!-- Package visibility for read-aloud (text-to-speech) and voice typing (speech recognition). -->
+    <queries>
+        <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
+        <intent><action android:name="android.speech.action.RECOGNIZE_SPEECH" /></intent>
+    </queries>
     <application
         android:name=".App"
         android:allowBackup="true"
+        android:dataExtractionRules="@xml/backup_rules"
+        android:fullBackupContent="@xml/full_backup_content"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
@@ -92,6 +100,24 @@ w(f"{root}/app/src/main/AndroidManifest.xml", f"""<?xml version="1.0" encoding="
         </activity>
     </application>
 </manifest>
+""")
+# Backups keep the app's data but never the API key: store AiSettings in JsonStore(context, "secrets").
+w(f"{root}/app/src/main/res/xml/backup_rules.xml", """<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+: back up the app's data, but never the API key (secrets.xml shared prefs). -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="secrets.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="secrets.xml" />
+    </device-transfer>
+</data-extraction-rules>
+""")
+w(f"{root}/app/src/main/res/xml/full_backup_content.xml", """<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and below: same rule, the API key (secrets.xml) is never backed up. -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="secrets.xml" />
+</full-backup-content>
 """)
 w(f"{root}/app/src/main/res/values/strings.xml", f'<resources>\n    <string name="app_name">{app}</string>\n</resources>\n')
 w(f"{root}/app/src/main/res/values/themes.xml", """<resources>
