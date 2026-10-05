@@ -39,12 +39,16 @@ data class AiSettings(
     val effectiveBaseUrl get() = baseUrl.ifBlank { provider.defaultBaseUrl }.trimEnd('/')
         .let { if (it.endsWith("/v1", ignoreCase = true)) it.dropLast(3).trimEnd('/') else it }
     /**
-     * Root the OpenAI-compatible paths hang off: `<base>/v1`, unless the base URL already names its own API version
-     * (Gemini's `…/v1beta/openai`, `…/openai/v2`), in which case it is used as-is.
+     * Root the OpenAI-compatible paths hang off: `<base>/v1`, unless the base URL already ends in its own API version
+     * (`…/v2`, `…/v1beta`) or is a versioned `…/openai` compatibility path (Gemini's `…/v1beta/openai`, Cloudflare AI
+     * Gateway's `…/v1/<account>/<gateway>/openai`). A version segment elsewhere (Cloudflare Workers AI's
+     * `…/client/v4/accounts/<id>/ai`) doesn't count, so that one still gets `/v1`.
      */
     val openAiRoot: String get() = effectiveBaseUrl.let { b ->
-        val path = b.substringAfter("://").substringAfter('/', "")
-        if (Regex("(^|/)v\\d+[a-z0-9]*(/|$)", RegexOption.IGNORE_CASE).containsMatchIn(path)) b else "$b/v1"
+        val path = "/" + b.substringAfter("://").substringAfter('/', "")
+        val version = Regex("/v\\d+[a-z0-9]*(?=/|$)", RegexOption.IGNORE_CASE)
+        val endsVersioned = Regex("/v\\d+[a-z0-9]*$", RegexOption.IGNORE_CASE).containsMatchIn(path)
+        if (endsVersioned || (path.endsWith("/openai", ignoreCase = true) && version.containsMatchIn(path))) b else "$b/v1"
     }
     /** OpenAI's own API (as opposed to another OpenAI-compatible server). */
     val isOpenAi: Boolean get() = provider == AiProvider.OPENAI_COMPAT && effectiveBaseUrl.contains("api.openai.com", ignoreCase = true)
@@ -150,8 +154,11 @@ class AiClient(
     private fun fallbacksFor(s: AiSettings): Boolean =
         !fallbacksRejected && s.baseUrl.isBlank() && s.effectiveModel in FALLBACK_MODELS
 
-    /** Set once an OpenAI-compatible server asks for max_completion_tokens instead of max_tokens. */
-    @Volatile private var maxCompletionTokensNeeded = false
+    /** OpenAI-compatible roots that asked for max_completion_tokens instead of max_tokens. */
+    private val completionTokenRoots: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    /** Set once an OpenAI model rejects `reasoning_effort`, so we stop sending it for this process. */
+    @Volatile private var reasoningRejected = false
 
     /** Set once a model rejects `output_config.effort`, so we stop sending it for this process. */
     @Volatile private var effortRejected = false
@@ -226,11 +233,14 @@ class AiClient(
     private suspend fun openai(s: AiSettings, system: String, messages: List<ChatMsg>, schema: JsonObject?, maxTokens: Int): AiReply {
         // OpenAI's reasoning models (o-series, gpt-5…) reject max_tokens; its API accepts max_completion_tokens for every
         // chat model, and reasoning tokens count against it. Other servers mostly only know max_tokens and often cap it at 8K.
-        val completionTokens = s.isOpenAi || maxCompletionTokensNeeded
-        val reasoning = s.isOpenAi && Regex("^(o\\d|gpt-5)", RegexOption.IGNORE_CASE).containsMatchIn(s.effectiveModel)
+        val completionTokens = s.isOpenAi || s.openAiRoot in completionTokenRoots
+        // Reasoning models only; "-chat" snapshots (gpt-5-chat-latest…) are non-reasoning and reject the parameter.
+        val reasoning = s.isOpenAi && !reasoningRejected && Regex("^(o\\d|gpt-5)", RegexOption.IGNORE_CASE).containsMatchIn(s.effectiveModel) &&
+            !s.effectiveModel.contains("chat", ignoreCase = true)
         val body = buildJsonObject {
             put("model", s.effectiveModel)
-            if (completionTokens) put("max_completion_tokens", maxTokens) else put("max_tokens", maxTokens.coerceAtMost(8000))
+            val limit = if (s.isOpenAi) maxTokens else maxTokens.coerceAtMost(8000)
+            if (completionTokens) put("max_completion_tokens", limit) else put("max_tokens", limit)
             if (reasoning) put("reasoning_effort", "low")
             if (schema != null) putJsonObject("response_format") { put("type", "json_object") }
             put("messages", buildJsonArray {
@@ -251,7 +261,11 @@ class AiClient(
         } catch (e: AiException) {
             // A gateway in front of an OpenAI reasoning model: switch parameter once and remember it.
             if (!completionTokens && e.status == 400 && e.message.orEmpty().contains("max_completion_tokens")) {
-                maxCompletionTokensNeeded = true
+                completionTokenRoots += s.openAiRoot
+                return openai(s, system, messages, schema, maxTokens)
+            }
+            if (reasoning && e.status == 400 && e.message.orEmpty().contains("reasoning_effort")) {
+                reasoningRejected = true
                 return openai(s, system, messages, schema, maxTokens)
             }
             throw e
@@ -291,8 +305,7 @@ class AiClient(
     private fun blockingCall(conn: HttpURLConnection, body: String?): String {
         var sent = false
         try {
-            if (body != null) conn.outputStream.use { it.write(body.toByteArray()) }
-            sent = true
+            if (body != null) { conn.outputStream.use { it.write(body.toByteArray()) }; sent = true }
             val code = conn.responseCode
             val text = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText().orEmpty()
             if (code !in 200..299) {
