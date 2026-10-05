@@ -35,7 +35,19 @@ data class AiSettings(
     val baseUrl: String = "",
 ) {
     val effectiveModel get() = model.ifBlank { provider.defaultModel }
+    /** Base URL without a trailing slash or trailing "/v1" (the client adds the API version itself). */
     val effectiveBaseUrl get() = baseUrl.ifBlank { provider.defaultBaseUrl }.trimEnd('/')
+        .let { if (it.endsWith("/v1", ignoreCase = true)) it.dropLast(3).trimEnd('/') else it }
+    /**
+     * Root the OpenAI-compatible paths hang off: `<base>/v1`, unless the base URL already names its own API version
+     * (Gemini's `…/v1beta/openai`, `…/openai/v2`), in which case it is used as-is.
+     */
+    val openAiRoot: String get() = effectiveBaseUrl.let { b ->
+        val path = b.substringAfter("://").substringAfter('/', "")
+        if (Regex("(^|/)v\\d+[a-z0-9]*(/|$)", RegexOption.IGNORE_CASE).containsMatchIn(path)) b else "$b/v1"
+    }
+    /** OpenAI's own API (as opposed to another OpenAI-compatible server). */
+    val isOpenAi: Boolean get() = provider == AiProvider.OPENAI_COMPAT && effectiveBaseUrl.contains("api.openai.com", ignoreCase = true)
     val configured get() = apiKey.isNotBlank()
 }
 
@@ -54,7 +66,11 @@ data class AiReply(val text: String, val usage: AiUsage = AiUsage(), val model: 
  * Transient failures (429, 5xx, 529 overloaded, dropped connections) are retried with backoff,
  * and a cancelled coroutine aborts the in-flight request.
  */
-class AiClient(val json: Json = Json { ignoreUnknownKeys = true; isLenient = true; encodeDefaults = true }) {
+class AiClient(
+    val json: Json = Json { ignoreUnknownKeys = true; isLenient = true; encodeDefaults = true },
+    /** How long a generation may take; answers aren't streamed, so nothing arrives until the whole document is written. */
+    private val generationTimeoutMs: Int = 600_000,
+) {
 
     class AiException(msg: String, val status: Int = 0, val retryAfterSeconds: Long? = null) : Exception(msg)
 
@@ -99,7 +115,7 @@ class AiClient(val json: Json = Json { ignoreUnknownKeys = true; isLenient = tru
         if (!s.configured) throw AiException("Add your API key first.")
         val (url, headers) = when (s.provider) {
             AiProvider.ANTHROPIC -> "${s.effectiveBaseUrl}/v1/models?limit=100" to mapOf("x-api-key" to s.apiKey, "anthropic-version" to "2023-06-01")
-            AiProvider.OPENAI_COMPAT -> "${s.effectiveBaseUrl}/v1/models" to mapOf("Authorization" to "Bearer ${s.apiKey}")
+            AiProvider.OPENAI_COMPAT -> "${s.openAiRoot}/models" to mapOf("Authorization" to "Bearer ${s.apiKey}")
         }
         val obj = json.parseToJsonElement(withRetry { request("GET", url, null, headers) }).jsonObject
         obj["data"]?.jsonArray?.mapNotNull { it.jsonObject["id"]?.jsonPrimitive?.contentOrNull }.orEmpty()
@@ -133,6 +149,9 @@ class AiClient(val json: Json = Json { ignoreUnknownKeys = true; isLenient = tru
 
     private fun fallbacksFor(s: AiSettings): Boolean =
         !fallbacksRejected && s.baseUrl.isBlank() && s.effectiveModel in FALLBACK_MODELS
+
+    /** Set once an OpenAI-compatible server asks for max_completion_tokens instead of max_tokens. */
+    @Volatile private var maxCompletionTokensNeeded = false
 
     /** Set once a model rejects `output_config.effort`, so we stop sending it for this process. */
     @Volatile private var effortRejected = false
@@ -189,26 +208,30 @@ class AiClient(val json: Json = Json { ignoreUnknownKeys = true; isLenient = tru
         }
         val obj = json.parseToJsonElement(resp).jsonObject
         obj["error"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull?.let { throw AiException(it) }
+        val u = obj["usage"]?.jsonObject
+        val usage = AiUsage(u.long("input_tokens") + u.long("cache_read_input_tokens") + u.long("cache_creation_input_tokens"), u.long("output_tokens"))
         when (obj["stop_reason"]?.jsonPrimitive?.contentOrNull) {
             "refusal" -> {
                 val why = obj["stop_details"]?.let { runCatching { it.jsonObject["explanation"]?.jsonPrimitive?.contentOrNull }.getOrNull() }
-                throw AiException("The model declined this request." + (why?.takeIf { it.isNotBlank() }?.let { " $it" } ?: ""))
+                billedFailure(usage, "The model declined this request." + (why?.takeIf { it.isNotBlank() }?.let { " $it" } ?: ""))
             }
-            "max_tokens" -> if (schema != null) throw AiException(TOO_LONG)
+            "max_tokens" -> if (schema != null) billedFailure(usage, TOO_LONG)
         }
         val text = obj["content"]?.jsonArray?.filter { it.jsonObject["type"]?.jsonPrimitive?.contentOrNull == "text" }
             ?.joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull.orEmpty() }
-            ?.ifBlank { null } ?: throw AiException("Empty response from model.")
-        val usage = obj["usage"]?.jsonObject
-        return AiReply(text, AiUsage(usage.long("input_tokens") + usage.long("cache_read_input_tokens") + usage.long("cache_creation_input_tokens"), usage.long("output_tokens")),
-            obj["model"]?.jsonPrimitive?.contentOrNull ?: s.effectiveModel)
+            ?.ifBlank { null } ?: billedFailure(usage, "Empty response from model.")
+        return AiReply(text, usage, obj["model"]?.jsonPrimitive?.contentOrNull ?: s.effectiveModel)
     }
 
     private suspend fun openai(s: AiSettings, system: String, messages: List<ChatMsg>, schema: JsonObject?, maxTokens: Int): AiReply {
+        // OpenAI's reasoning models (o-series, gpt-5…) reject max_tokens; its API accepts max_completion_tokens for every
+        // chat model, and reasoning tokens count against it. Other servers mostly only know max_tokens and often cap it at 8K.
+        val completionTokens = s.isOpenAi || maxCompletionTokensNeeded
+        val reasoning = s.isOpenAi && Regex("^(o\\d|gpt-5)", RegexOption.IGNORE_CASE).containsMatchIn(s.effectiveModel)
         val body = buildJsonObject {
             put("model", s.effectiveModel)
-            // Many OpenAI-compatible models cap completions at 8K; asking for more is a 400 on some servers.
-            put("max_tokens", maxTokens.coerceAtMost(8000))
+            if (completionTokens) put("max_completion_tokens", maxTokens) else put("max_tokens", maxTokens.coerceAtMost(8000))
+            if (reasoning) put("reasoning_effort", "low")
             if (schema != null) putJsonObject("response_format") { put("type", "json_object") }
             put("messages", buildJsonArray {
                 add(buildJsonObject { put("role", "system"); put("content", if (schema != null) "$system\n\nRespond with JSON only matching this schema: $schema" else system) })
@@ -223,15 +246,31 @@ class AiClient(val json: Json = Json { ignoreUnknownKeys = true; isLenient = tru
                 }
             })
         }
-        val resp = request("POST", "${s.effectiveBaseUrl}/v1/chat/completions", body.toString(), mapOf("Authorization" to "Bearer ${s.apiKey}"))
+        val resp = try {
+            request("POST", "${s.openAiRoot}/chat/completions", body.toString(), mapOf("Authorization" to "Bearer ${s.apiKey}"))
+        } catch (e: AiException) {
+            // A gateway in front of an OpenAI reasoning model: switch parameter once and remember it.
+            if (!completionTokens && e.status == 400 && e.message.orEmpty().contains("max_completion_tokens")) {
+                maxCompletionTokensNeeded = true
+                return openai(s, system, messages, schema, maxTokens)
+            }
+            throw e
+        }
         val obj = json.parseToJsonElement(resp).jsonObject
         obj["error"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull?.let { throw AiException(it) }
+        val u = obj["usage"]?.jsonObject
+        val usage = AiUsage(u.long("prompt_tokens"), u.long("completion_tokens"))
         val choice = obj["choices"]?.jsonArray?.firstOrNull()?.jsonObject
-        if (schema != null && choice?.get("finish_reason")?.jsonPrimitive?.contentOrNull == "length") throw AiException(TOO_LONG)
+        if (schema != null && choice?.get("finish_reason")?.jsonPrimitive?.contentOrNull == "length") billedFailure(usage, TOO_LONG)
         val text = choice?.get("message")?.jsonObject?.get("content")?.jsonPrimitive?.contentOrNull?.ifBlank { null }
-            ?: throw AiException("Empty response from model.")
-        val usage = obj["usage"]?.jsonObject
-        return AiReply(text, AiUsage(usage.long("prompt_tokens"), usage.long("completion_tokens")), obj["model"]?.jsonPrimitive?.contentOrNull ?: s.effectiveModel)
+            ?: billedFailure(usage, "Empty response from model.")
+        return AiReply(text, usage, obj["model"]?.jsonPrimitive?.contentOrNull ?: s.effectiveModel)
+    }
+
+    /** The provider answered (and billed) but the answer can't be used: count the tokens, then fail. */
+    private fun billedFailure(usage: AiUsage, message: String): Nothing {
+        if (usage.inputTokens + usage.outputTokens > 0) onUsage?.invoke(usage)
+        throw AiException(message)
     }
 
     private fun JsonObject?.long(key: String): Long = this?.get(key)?.let { runCatching { it.jsonPrimitive.longOrNull }.getOrNull() } ?: 0L
@@ -240,7 +279,8 @@ class AiClient(val json: Json = Json { ignoreUnknownKeys = true; isLenient = tru
     private suspend fun request(method: String, url: String, body: String?, headers: Map<String, String>): String =
         suspendCancellableCoroutine { cont ->
             val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = method; connectTimeout = 20_000; readTimeout = 180_000; doOutput = body != null
+                // Answers aren't streamed, so nothing arrives until the whole document is written: allow long generations.
+                requestMethod = method; connectTimeout = 20_000; readTimeout = if (body != null) generationTimeoutMs else 60_000; doOutput = body != null
                 setRequestProperty("Content-Type", "application/json")
                 headers.forEach { (k, v) -> setRequestProperty(k, v) }
             }
@@ -249,8 +289,10 @@ class AiClient(val json: Json = Json { ignoreUnknownKeys = true; isLenient = tru
         }
 
     private fun blockingCall(conn: HttpURLConnection, body: String?): String {
+        var sent = false
         try {
             if (body != null) conn.outputStream.use { it.write(body.toByteArray()) }
+            sent = true
             val code = conn.responseCode
             val text = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText().orEmpty()
             if (code !in 200..299) {
@@ -259,6 +301,10 @@ class AiClient(val json: Json = Json { ignoreUnknownKeys = true; isLenient = tru
                 throw AiException(friendly(code, msg ?: text.take(200)), code, retryAfter)
             }
             return text
+        } catch (e: java.net.SocketTimeoutException) {
+            // Timing out after the request went out is not retried: re-sending would start (and bill) the same long answer again.
+            if (sent) throw AiException("The provider took too long to answer. Try a faster model, or ask for a shorter answer.")
+            throw AiException("Network error: ${e.message}", NETWORK)
         } catch (e: java.io.IOException) {
             throw AiException("Network error: ${e.message}", NETWORK)
         } finally { conn.disconnect() }

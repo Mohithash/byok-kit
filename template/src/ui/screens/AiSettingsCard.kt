@@ -50,6 +50,7 @@ import __PKG__.ai.ChatMsg
 import __PKG__.ui.Label
 import __PKG__.ui.ShapeIcon
 import __PKG__.ui.StatCard
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 /**
@@ -104,12 +105,13 @@ fun AiSettingsCard(current: AiSettings, client: AiClient, onSave: (AiSettings) -
                             onClick = {
                                 loadingModels = true
                                 scope.launch {
-                                    val r = runCatching { client.listModels(build()) }
-                                    loadingModels = false
-                                    r.onSuccess { ids ->
+                                    try {
+                                        val ids = client.listModels(build())
                                         if (ids.isEmpty()) onMessage("The provider didn't list any models — type one in.")
                                         else { fetched = ids; modelMenu = true }
-                                    }.onFailure { onMessage(it.message ?: "Couldn't load models") }
+                                    } catch (e: CancellationException) { throw e // left the screen: say nothing
+                                    } catch (e: Exception) { onMessage(e.message ?: "Couldn't load models")
+                                    } finally { loadingModels = false }
                                 }
                             },
                             enabled = key.isNotBlank(),
@@ -131,15 +133,24 @@ fun AiSettingsCard(current: AiSettings, client: AiClient, onSave: (AiSettings) -
             }
         }
         OutlinedTextField(baseUrl, { baseUrl = it }, label = { Text("Base URL") }, placeholder = { Text(provider.defaultBaseUrl) }, singleLine = true, modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large,
-            supportingText = { if (provider == AiProvider.OPENAI_COMPAT) Text("Works with OpenAI, Groq, OpenRouter, Ollama, LM Studio…") })
+            supportingText = {
+                when {
+                    baseUrl.trim().startsWith("http://", ignoreCase = true) -> Text("Plain http:// is unencrypted — only use it for a server on your own device or network (Ollama, LM Studio).")
+                    provider == AiProvider.OPENAI_COMPAT -> Text("Works with OpenAI, Groq, OpenRouter, Ollama, LM Studio…")
+                }
+            })
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedButton(
                 onClick = {
                     testing = true
                     scope.launch {
-                        val r = runCatching { client.chatFull(build(), "Reply with the single word OK.", listOf(ChatMsg("user", "ping")), maxTokens = 256) }
-                        testing = false
-                        onMessage(r.fold({ "Connected to ${it.model.ifBlank { build().effectiveModel }} — replied “${it.text.trim().take(40)}”" }, { it.message ?: "Failed" }))
+                        try {
+                            // 1024: current Claude models always think, so a tiny limit can come back empty.
+                            val r = client.chatFull(build(), "Reply with the single word OK.", listOf(ChatMsg("user", "ping")), maxTokens = 1024)
+                            onMessage("Connected to ${r.model.ifBlank { build().effectiveModel }} — replied “${r.text.trim().take(40)}”")
+                        } catch (e: CancellationException) { throw e
+                        } catch (e: Exception) { onMessage(e.message ?: "Failed")
+                        } finally { testing = false }
                     }
                 }, enabled = key.isNotBlank() && !testing, shapes = ButtonDefaults.shapes(), modifier = Modifier.weight(1f),
             ) { if (testing) LoadingIndicator(Modifier.size(20.dp)) else Text("Test") }

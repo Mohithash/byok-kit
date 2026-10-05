@@ -11,14 +11,19 @@ class JsonStore(context: Context, name: String = "store") {
     private val sp = context.getSharedPreferences(name, Context.MODE_PRIVATE)
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val flows = HashMap<String, MutableStateFlow<Any?>>()
+    /** Per key: how to (re)read its value from disk, so raw writes keep open flows current. */
+    private val loaders = HashMap<String, () -> Any?>()
 
     @Suppress("UNCHECKED_CAST")
     fun <T> flow(key: String, serializer: KSerializer<T>, default: T): StateFlow<T> = synchronized(flows) {
         flows.getOrPut(key) {
-            val v = sp.getString(key, null)?.let { runCatching { json.decodeFromString(serializer, it) }.getOrNull() } ?: default
-            MutableStateFlow(v as Any?)
+            val load = { sp.getString(key, null)?.let { runCatching { json.decodeFromString(serializer, it) }.getOrNull() } ?: default }
+            loaders[key] = load
+            MutableStateFlow(load() as Any?)
         } as StateFlow<T>
     }
+
+    private fun reload(key: String) = synchronized(flows) { flows[key]?.let { f -> loaders[key]?.let { f.value = it() } } }
 
     fun <T> set(key: String, serializer: KSerializer<T>, value: T) {
         sp.edit().putString(key, json.encodeToString(serializer, value)).apply()
@@ -32,6 +37,6 @@ class JsonStore(context: Context, name: String = "store") {
 
     /** Raw stored JSON for [key], or null. */
     fun raw(key: String): String? = sp.getString(key, null)
-    fun putRaw(key: String, value: String) { sp.edit().putString(key, value).commit() }
-    fun remove(key: String) { sp.edit().remove(key).commit(); synchronized(flows) { flows.remove(key) } }
+    fun putRaw(key: String, value: String) = synchronized(this) { sp.edit().putString(key, value).commit(); reload(key) }
+    fun remove(key: String) = synchronized(this) { sp.edit().remove(key).commit(); reload(key) }
 }

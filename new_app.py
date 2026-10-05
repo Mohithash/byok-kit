@@ -88,6 +88,7 @@ w(f"{root}/app/src/main/AndroidManifest.xml", f"""<?xml version="1.0" encoding="
         android:allowBackup="true"
         android:dataExtractionRules="@xml/backup_rules"
         android:fullBackupContent="@xml/full_backup_content"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
@@ -118,6 +119,15 @@ w(f"{root}/app/src/main/res/xml/full_backup_content.xml", """<?xml version="1.0"
 <full-backup-content>
     <exclude domain="sharedpref" path="secrets.xml" />
 </full-backup-content>
+""")
+# HTTPS by default; plain http only so the OpenAI-compatible provider can point at a model server on the
+# user's own device/LAN (Ollama, LM Studio). The settings card warns about http:// URLs.
+w(f"{root}/app/src/main/res/xml/network_security_config.xml", """<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors><certificates src="system" /></trust-anchors>
+    </base-config>
+</network-security-config>
 """)
 w(f"{root}/app/src/main/res/values/strings.xml", f'<resources>\n    <string name="app_name">{app}</string>\n</resources>\n')
 w(f"{root}/app/src/main/res/values/themes.xml", """<resources>
